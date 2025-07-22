@@ -8,6 +8,7 @@ import time
 import sys
 import math
 import argparse
+import threading
 from typing import Tuple, List
 
 # MediaPipe initialization
@@ -20,38 +21,40 @@ SCREEN_WIDTH = 1920  # Adjust to your screen resolution
 SCREEN_HEIGHT = 1080  # Adjust to your screen resolution
 SMOOTHING_FACTOR = 0.8  # Adjust for smoother transitions (higher = smoother but more lag)
 FOCUS_COOLDOWN = 1.5  # Seconds between focus changes
-HEAD_ROTATION_THRESHOLD = 0.5  # Threshold for head rotation to trigger monitor change
 VIDEO_WIDTH = 320  # Lower resolution for better performance
 VIDEO_HEIGHT = 240  # Lower resolution for better performance
+FRAME_RATE = 10  # Process fewer frames per second to reduce CPU usage
+PROCESS_EVERY_N_FRAMES = 3  # Only process every Nth frame to reduce CPU usage
 
 # Head position thresholds
 LEFT_THRESHOLD = -0.3  # Values below this are considered "looking left"
 RIGHT_THRESHOLD = 0.3  # Values above this are considered "looking right"
 # Values between LEFT_THRESHOLD and RIGHT_THRESHOLD are considered "center"
 
-# Eye landmarks indices (based on MediaPipe Face Mesh)
-LEFT_EYE_INDICES = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
-RIGHT_EYE_INDICES = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
-LEFT_IRIS_INDICES = [474, 475, 476, 477]
-RIGHT_IRIS_INDICES = [469, 470, 471, 472]
-
-# Head pose landmarks
-HEAD_POSE_LANDMARKS = [33, 263, 1, 61, 291, 199]
+# Camera indices to try (USB cameras typically start at 0 or 1)
+CAMERA_INDICES = [1, 0, 2]  # Try USB camera (1) first, then built-in (0), then another USB port (2)
 
 class HeadTracker:
-    def __init__(self, center_position="center"):
+    def __init__(self, center_position="center", debug_mode=True):
         self.last_focus_time = 0
         self.prev_head_rotation = 0
         self.monitors = self._get_monitors()
+        
+        # Performance optimization: Use static image mode for less CPU usage
         self.face_mesh = mp_face_mesh.FaceMesh(
             max_num_faces=1,
             refine_landmarks=True,
             min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.5,
+            static_image_mode=False  # Faster processing for video
         )
+        
         self.cap = None
         self.running = False
-        self.debug_mode = True
+        self.debug_mode = debug_mode
+        self.frame_count = 0
+        self.last_frame_time = time.time()
+        self.fps = 0
         
         # Center position configuration
         self.center_position = center_position
@@ -69,6 +72,13 @@ class HeadTracker:
         
         # For tracking head position zone
         self.current_head_zone = "center"
+        
+        # For background processing
+        self.processing_thread = None
+        self.last_frame = None
+        self.frame_ready = False
+        self.result_ready = False
+        self.processed_results = None
         
     def _get_monitors(self):
         """Get list of monitors from Hyprland"""
@@ -93,17 +103,30 @@ class HeadTracker:
         except Exception as e:
             print(f"Error getting monitors: {e}")
             return [0]  # Default to one monitor
+    
+    def _try_open_camera(self):
+        """Try to open camera, attempting multiple indices"""
+        for idx in CAMERA_INDICES:
+            print(f"Trying camera index {idx}...")
+            cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                print(f"Successfully opened camera at index {idx}")
+                return cap
+        
+        print("Could not open any camera")
+        return None
         
     def start(self):
         """Start the head tracking process"""
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            print("Error: Could not open camera.")
+        self.cap = self._try_open_camera()
+        if not self.cap:
+            print("Error: Could not open any camera.")
             return
             
         # Set lower resolution for better performance
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VIDEO_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, FRAME_RATE)
         
         self.running = True
         print("Head tracking started. Press 'q' to quit.")
@@ -121,19 +144,68 @@ class HeadTracker:
         cv2.destroyAllWindows()
         print("Head tracking stopped.")
     
+    def _process_frame_background(self, frame):
+        """Process a frame in a background thread"""
+        if frame is None:
+            return
+            
+        # Convert to RGB and process with MediaPipe
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(image_rgb)
+        
+        if results.multi_face_landmarks:
+            face_landmarks = results.multi_face_landmarks[0]
+            
+            # Get head rotation
+            head_rotation = self._estimate_head_rotation(face_landmarks)
+            
+            # Apply smoothing
+            smoothed_rotation = self._smooth_head_rotation(head_rotation)
+            
+            # Determine head position zone (left, center, right)
+            self._update_head_zone(smoothed_rotation)
+            
+            # Store results for main thread
+            self.processed_results = {
+                "face_landmarks": face_landmarks,
+                "smoothed_rotation": smoothed_rotation
+            }
+            self.result_ready = True
+    
     def _tracking_loop(self):
         """Main tracking loop"""
         while self.running and self.cap.isOpened():
-            success, image = self.cap.read()
+            # Calculate FPS
+            current_time = time.time()
+            if current_time - self.last_frame_time >= 1.0:
+                self.fps = self.frame_count
+                self.frame_count = 0
+                self.last_frame_time = current_time
+            else:
+                self.frame_count += 1
+            
+            # Read frame
+            success, frame = self.cap.read()
             if not success:
                 print("Failed to capture frame from camera.")
                 break
             
             # Flip the image horizontally for a selfie-view display
-            image = cv2.flip(image, 1)
+            frame = cv2.flip(frame, 1)
             
-            # Convert to RGB and process with MediaPipe
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # Skip frames to reduce CPU usage
+            if self.frame_count % PROCESS_EVERY_N_FRAMES != 0:
+                if self.debug_mode:
+                    self._update_debug_display(frame)
+                    cv2.imshow('MediaPipe Head Tracking', frame)
+                
+                # Check for quit command
+                if cv2.waitKey(5) & 0xFF == ord('q'):
+                    break
+                continue
+            
+            # Process frame
+            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.face_mesh.process(image_rgb)
             
             if results.multi_face_landmarks:
@@ -141,7 +213,7 @@ class HeadTracker:
                 
                 if self.debug_mode:
                     # Draw face mesh
-                    self._draw_face_mesh(image, face_landmarks)
+                    self._draw_face_mesh(frame, face_landmarks)
                 
                 # Get head rotation
                 head_rotation = self._estimate_head_rotation(face_landmarks)
@@ -157,38 +229,39 @@ class HeadTracker:
                 
                 if self.debug_mode:
                     # Add debug info to image
-                    cv2.putText(image, f"Head Rotation: {smoothed_rotation:.2f}", (10, 30), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(image, f"Head Zone: {self.current_head_zone}", (10, 60), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(image, f"Current Monitor: {self.current_monitor}", (10, 90), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(image, f"Center: {self.center_position}", (10, 120), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    self._update_debug_display(frame, smoothed_rotation)
             
             # Display the image if in debug mode
             if self.debug_mode:
-                cv2.imshow('MediaPipe Head Tracking', image)
+                cv2.imshow('MediaPipe Head Tracking', frame)
             
             # Check for quit command
             if cv2.waitKey(5) & 0xFF == ord('q'):
                 break
     
+    def _update_debug_display(self, frame, smoothed_rotation=None):
+        """Update the debug information displayed on the frame"""
+        # Add FPS counter
+        cv2.putText(frame, f"FPS: {self.fps}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        if smoothed_rotation is not None:
+            cv2.putText(frame, f"Head Rotation: {smoothed_rotation:.2f}", (10, 60), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, f"Head Zone: {self.current_head_zone}", (10, 90), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, f"Current Monitor: {self.current_monitor}", (10, 120), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, f"Center: {self.center_position}", (10, 150), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    
     def _draw_face_mesh(self, image, face_landmarks):
         """Draw the face mesh on the image"""
+        # Only draw essential landmarks to save CPU
         mp_drawing.draw_landmarks(
             image=image,
             landmark_list=face_landmarks,
-            connections=mp_face_mesh.FACEMESH_TESSELATION,
-            landmark_drawing_spec=None,
-            connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style()
-        )
-        
-        # Draw eyes and irises with different color
-        mp_drawing.draw_landmarks(
-            image=image,
-            landmark_list=face_landmarks,
-            connections=mp_face_mesh.FACEMESH_IRISES,
+            connections=mp_face_mesh.FACEMESH_IRISES,  # Only draw eyes
             landmark_drawing_spec=None,
             connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_iris_connections_style()
         )
@@ -287,11 +360,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Head tracking for Hyprland monitor focus")
     parser.add_argument("--center", choices=["left", "center", "right"], default="center",
                         help="Define where the center position is (default: center)")
+    parser.add_argument("--no-debug", action="store_true",
+                        help="Disable debug display to save CPU")
     return parser.parse_args()
 
 def main():
     args = parse_args()
-    tracker = HeadTracker(center_position=args.center)
+    tracker = HeadTracker(center_position=args.center, debug_mode=not args.no_debug)
     try:
         tracker.start()
     except KeyboardInterrupt:
