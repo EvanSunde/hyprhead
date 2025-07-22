@@ -20,9 +20,14 @@ SCREEN_WIDTH = 1920  # Adjust to your screen resolution
 SCREEN_HEIGHT = 1080  # Adjust to your screen resolution
 SMOOTHING_FACTOR = 0.8  # Adjust for smoother transitions (higher = smoother but more lag)
 FOCUS_COOLDOWN = 1.5  # Seconds between focus changes
-HEAD_ROTATION_THRESHOLD = 0.15  # Threshold for head rotation to trigger monitor change
+HEAD_ROTATION_THRESHOLD = 0.5  # Threshold for head rotation to trigger monitor change
 VIDEO_WIDTH = 320  # Lower resolution for better performance
 VIDEO_HEIGHT = 240  # Lower resolution for better performance
+
+# Head position thresholds
+LEFT_THRESHOLD = -0.3  # Values below this are considered "looking left"
+RIGHT_THRESHOLD = 0.3  # Values above this are considered "looking right"
+# Values between LEFT_THRESHOLD and RIGHT_THRESHOLD are considered "center"
 
 # Eye landmarks indices (based on MediaPipe Face Mesh)
 LEFT_EYE_INDICES = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
@@ -36,9 +41,7 @@ HEAD_POSE_LANDMARKS = [33, 263, 1, 61, 291, 199]
 class HeadTracker:
     def __init__(self, center_position="center"):
         self.last_focus_time = 0
-        self.prev_gaze_point = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
         self.prev_head_rotation = 0
-        self.current_monitor = 0
         self.monitors = self._get_monitors()
         self.face_mesh = mp_face_mesh.FaceMesh(
             max_num_faces=1,
@@ -53,6 +56,19 @@ class HeadTracker:
         # Center position configuration
         self.center_position = center_position
         print(f"Center position set to: {self.center_position}")
+        
+        # Set current monitor based on center position
+        if self.center_position == "right" and len(self.monitors) > 1:
+            self.current_monitor = 1  # Right monitor
+        else:  # "left" or "center"
+            self.current_monitor = 0  # Left monitor
+            
+        # Initialize focus to the current monitor
+        self._switch_to_monitor(self.current_monitor)
+        print(f"Initially focused on monitor {self.current_monitor}")
+        
+        # For tracking head position zone
+        self.current_head_zone = "center"
         
     def _get_monitors(self):
         """Get list of monitors from Hyprland"""
@@ -133,16 +149,21 @@ class HeadTracker:
                 # Apply smoothing
                 smoothed_rotation = self._smooth_head_rotation(head_rotation)
                 
-                # Focus monitor based on head rotation
-                self._focus_monitor_based_on_head(smoothed_rotation)
+                # Determine head position zone (left, center, right)
+                self._update_head_zone(smoothed_rotation)
+                
+                # Focus monitor based on head zone
+                self._focus_monitor_based_on_head_zone()
                 
                 if self.debug_mode:
                     # Add debug info to image
                     cv2.putText(image, f"Head Rotation: {smoothed_rotation:.2f}", (10, 30), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(image, f"Current Monitor: {self.current_monitor}", (10, 60), 
+                    cv2.putText(image, f"Head Zone: {self.current_head_zone}", (10, 60), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(image, f"Center: {self.center_position}", (10, 90), 
+                    cv2.putText(image, f"Current Monitor: {self.current_monitor}", (10, 90), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(image, f"Center: {self.center_position}", (10, 120), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             # Display the image if in debug mode
@@ -196,46 +217,57 @@ class HeadTracker:
         self.prev_head_rotation = smoothed_rotation
         return smoothed_rotation
     
-    def _focus_monitor_based_on_head(self, head_rotation):
-        """Focus monitor based on head rotation"""
+    def _update_head_zone(self, head_rotation):
+        """Update the current head position zone (left, center, right)"""
+        if head_rotation < LEFT_THRESHOLD:
+            self.current_head_zone = "left"
+        elif head_rotation > RIGHT_THRESHOLD:
+            self.current_head_zone = "right"
+        else:
+            self.current_head_zone = "center"
+    
+    def _focus_monitor_based_on_head_zone(self):
+        """Focus monitor based on head zone and center position setting"""
         current_time = time.time()
         
         # Apply cooldown to prevent too frequent focus changes
         if current_time - self.last_focus_time < FOCUS_COOLDOWN:
             return
         
-        # Determine which monitor to focus based on head rotation and center position
-        if len(self.monitors) > 1:
-            # Adjust thresholds based on center position
-            if self.center_position == "left":
-                # When center is left, we need to turn head more to the left to trigger left monitor
-                if head_rotation < -HEAD_ROTATION_THRESHOLD * 2:
-                    target_monitor = 0  # Left monitor
-                elif head_rotation > -HEAD_ROTATION_THRESHOLD / 2:
-                    target_monitor = min(len(self.monitors) - 1, 1)  # Right monitor
-                else:
-                    return  # No change needed
-            elif self.center_position == "right":
-                # When center is right, we need to turn head more to the right to trigger right monitor
-                if head_rotation > HEAD_ROTATION_THRESHOLD * 2:
-                    target_monitor = min(len(self.monitors) - 1, 1)  # Right monitor
-                elif head_rotation < HEAD_ROTATION_THRESHOLD / 2:
-                    target_monitor = 0  # Left monitor
-                else:
-                    return  # No change needed
-            else:  # center (default)
-                if head_rotation < -HEAD_ROTATION_THRESHOLD:
-                    target_monitor = 0  # Left monitor
-                elif head_rotation > HEAD_ROTATION_THRESHOLD:
-                    target_monitor = min(len(self.monitors) - 1, 1)  # Right monitor
-                else:
-                    return  # No change needed
+        # Only proceed if we have multiple monitors
+        if len(self.monitors) <= 1:
+            return
             
-            # Only change if different from current
-            if target_monitor != self.current_monitor:
-                self._switch_to_monitor(target_monitor)
-                self.current_monitor = target_monitor
-                self.last_focus_time = current_time
+        # Determine target monitor based on head zone and center position
+        target_monitor = None
+        
+        if self.center_position == "left":
+            # When center is "left", both center and left head zones focus left monitor
+            if self.current_head_zone in ["left", "center"]:
+                target_monitor = 0  # Left monitor
+            else:  # right head zone
+                target_monitor = 1  # Right monitor
+                
+        elif self.center_position == "right":
+            # When center is "right", both center and right head zones focus right monitor
+            if self.current_head_zone in ["right", "center"]:
+                target_monitor = 1  # Right monitor
+            else:  # left head zone
+                target_monitor = 0  # Left monitor
+                
+        else:  # center position is "center"
+            # When center is "center", match head zone to monitor
+            if self.current_head_zone == "left":
+                target_monitor = 0  # Left monitor
+            elif self.current_head_zone == "right":
+                target_monitor = 1  # Right monitor
+            # For center head zone, keep current monitor (no change)
+        
+        # Only switch if we have a target and it's different from current
+        if target_monitor is not None and target_monitor != self.current_monitor:
+            self._switch_to_monitor(target_monitor)
+            self.current_monitor = target_monitor
+            self.last_focus_time = current_time
     
     def _switch_to_monitor(self, monitor_id):
         """Switch focus to the specified monitor"""
