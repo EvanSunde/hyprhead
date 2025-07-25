@@ -28,7 +28,7 @@ VIDEO_HEIGHT = 240  # Lower resolution for better performance
 FRAME_RATE = 10  # Process fewer frames per second to reduce CPU usage
 PROCESS_EVERY_N_FRAMES = 3  # Only process every Nth frame to reduce CPU usage
 GESTURE_STABILIZATION_FRAMES = 3  # Number of frames to stabilize a gesture
-SCROLL_AMOUNT = 3  # Constant scroll amount (adjust as needed)
+SCROLL_AMOUNT = 1  # Constant scroll amount (adjust as needed)
 PINCH_THRESHOLD = 0.02  # Threshold for pinch detection
 CLICK_COOLDOWN = 0.5  # Seconds between clicks
 
@@ -366,7 +366,7 @@ class HeadTracker:
         elif action == "scroll_down":
             command = ["ydotool", "mousemove", "-w", "-x 0", f"-y -{SCROLL_AMOUNT}"]
         elif action == "left_click":
-            command = ["ydotool", "click", "left"]
+            command = ["ydotool", "click", "c0"]
 
         if command:
             try:
