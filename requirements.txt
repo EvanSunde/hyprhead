@@ -1,4 +1,3 @@
 mediapipe
 opencv-python
-python-libxdo
 numpy 
