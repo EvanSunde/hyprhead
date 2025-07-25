@@ -28,6 +28,7 @@ VIDEO_HEIGHT = 240  # Lower resolution for better performance
 FRAME_RATE = 10  # Process fewer frames per second to reduce CPU usage
 PROCESS_EVERY_N_FRAMES = 3  # Only process every Nth frame to reduce CPU usage
 GESTURE_STABILIZATION_FRAMES = 3  # Number of frames to stabilize a gesture
+SCROLL_AMOUNT = 3  # Constant scroll amount (adjust as needed)
 
 # Head position thresholds
 LEFT_THRESHOLD = -0.6  # Values below this are considered "looking left"
@@ -267,7 +268,7 @@ class HeadTracker:
         current_time = time.time()
 
         # Detect gesture from the current frame
-        scroll_gesture, speed_factor = self._detect_scroll_gesture(hand_landmarks)
+        scroll_gesture = self._detect_scroll_gesture(hand_landmarks)
         
         # Add to gesture buffer for stabilization
         self.gesture_buffer.append(scroll_gesture)
@@ -284,20 +285,17 @@ class HeadTracker:
 
         # Execute action if gesture is stable and not "none"
         if can_scroll and stable_gesture != "none":
-            # We use the speed factor from the current frame for responsiveness
-            _, current_speed_factor = self._detect_scroll_gesture(hand_landmarks)
-            if current_speed_factor > 0: # Only scroll if there's speed
-                self._execute_mouse_action(stable_gesture, current_speed_factor)
-                self.last_scroll_time = current_time
+            self._execute_mouse_action(stable_gesture)
+            self.last_scroll_time = current_time
 
     def _get_landmark_dist(self, p1, p2) -> float:
         """Calculate Euclidean distance between two landmarks."""
         return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
 
-    def _detect_scroll_gesture(self, hand_landmarks) -> Tuple[str, float]:
+    def _detect_scroll_gesture(self, hand_landmarks) -> str:
         """
         Detects scroll gesture: Index and middle fingers pointing up or down,
-        while other fingers are folded. Returns gesture type and speed factor.
+        while other fingers are folded.
         """
         # Get landmark y-coordinates
         def is_finger_extended(tip_landmark, pip_landmark):
@@ -310,13 +308,12 @@ class HeadTracker:
 
         index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
         middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-        wrist = landmarks[mp_hands.HandLandmark.WRIST]
 
         # Check if index and middle fingers are close together
         fingers_are_joint = self._get_landmark_dist(index_tip, middle_tip) < 0.02 # Threshold for pinch detection
 
         if not fingers_are_joint:
-            return "none", 0.0
+            return "none"
 
         # Check extension/flexion of each finger
         index_extended = is_finger_extended(index_tip, landmarks[mp_hands.HandLandmark.INDEX_FINGER_PIP])
@@ -329,34 +326,27 @@ class HeadTracker:
 
         # Scroll up gesture
         if index_extended and middle_extended and ring_folded and pinky_folded:
-            # Calculate speed factor based on how high fingers are pointed
-            speed_factor = (wrist.y - index_tip.y) * 2.5 # Scale factor
-            return "scroll_up", max(0.1, speed_factor)
+            return "scroll_up"
         
         # Scroll down gesture
         if index_down and middle_down and ring_folded and pinky_folded:
-            # Calculate speed factor based on how low fingers are pointed
-            speed_factor = (index_tip.y - wrist.y) * 2.5 # Scale factor
-            return "scroll_down", max(0.1, speed_factor)
+            return "scroll_down"
             
-        return "none", 0.0
+        return "none"
 
-    def _execute_mouse_action(self, action: str, speed_factor: float = 1.0):
+    def _execute_mouse_action(self, action: str):
         """Executes a mouse action using ydotool."""
         command = []
-        scroll_amount = 0
 
         if action == "scroll_up":
-            scroll_amount = max(1, int(15 * speed_factor))
-            command = ["ydotool", "mousemove", "-w", "-x 0", f"-y {scroll_amount}"]
+            command = ["ydotool", "mousemove", "-w", "-x 0", f"-y {SCROLL_AMOUNT}"]
         elif action == "scroll_down":
-            scroll_amount = max(1, int(15 * speed_factor))
-            command = ["ydotool", "mousemove", "-w", "-x 0", f"-y -{scroll_amount}"]
+            command = ["ydotool", "mousemove", "-w", "-x 0", f"-y -{SCROLL_AMOUNT}"]
 
         if command:
             try:
                 subprocess.run(command, check=True, capture_output=True, text=True)
-                print(f"Executed action: {action} with amount {scroll_amount}")
+                print(f"Executed action: {action}")
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
                 print(f"Error executing ydotool for {action}: {e.stderr if hasattr(e, 'stderr') else e}")
     
