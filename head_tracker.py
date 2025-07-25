@@ -29,6 +29,8 @@ FRAME_RATE = 10  # Process fewer frames per second to reduce CPU usage
 PROCESS_EVERY_N_FRAMES = 3  # Only process every Nth frame to reduce CPU usage
 GESTURE_STABILIZATION_FRAMES = 3  # Number of frames to stabilize a gesture
 SCROLL_AMOUNT = 3  # Constant scroll amount (adjust as needed)
+PINCH_THRESHOLD = 0.02  # Threshold for pinch detection
+CLICK_COOLDOWN = 0.5  # Seconds between clicks
 
 # Head position thresholds
 LEFT_THRESHOLD = -0.6  # Values below this are considered "looking left"
@@ -62,6 +64,7 @@ class HeadTracker:
 
         # Gesture control state
         self.last_scroll_time = 0
+        self.last_click_time = 0
         self.gesture_buffer = []
         
         self.cap = None
@@ -267,7 +270,13 @@ class HeadTracker:
         """Detect and process hand gestures for mouse control."""
         current_time = time.time()
 
-        # Detect gesture from the current frame
+        # First check for pinch gesture (higher priority)
+        if self._detect_pinch_gesture(hand_landmarks) and (current_time - self.last_click_time) > CLICK_COOLDOWN:
+            self._execute_mouse_action("left_click")
+            self.last_click_time = current_time
+            return  # Skip scroll detection if we just clicked
+
+        # Detect scroll gesture from the current frame
         scroll_gesture = self._detect_scroll_gesture(hand_landmarks)
         
         # Add to gesture buffer for stabilization
@@ -287,6 +296,20 @@ class HeadTracker:
         if can_scroll and stable_gesture != "none":
             self._execute_mouse_action(stable_gesture)
             self.last_scroll_time = current_time
+
+    def _detect_pinch_gesture(self, hand_landmarks) -> bool:
+        """Detect pinch gesture between index finger and thumb."""
+        landmarks = hand_landmarks.landmark
+        
+        # Get thumb and index finger tip positions
+        thumb_tip = landmarks[mp_hands.HandLandmark.THUMB_TIP]
+        index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+        
+        # Calculate distance between thumb and index finger tips
+        distance = self._get_landmark_dist(thumb_tip, index_tip)
+        
+        # Return True if the distance is less than the threshold
+        return distance < PINCH_THRESHOLD
 
     def _get_landmark_dist(self, p1, p2) -> float:
         """Calculate Euclidean distance between two landmarks."""
@@ -310,7 +333,7 @@ class HeadTracker:
         middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
 
         # Check if index and middle fingers are close together
-        fingers_are_joint = self._get_landmark_dist(index_tip, middle_tip) < 0.02 # Threshold for pinch detection
+        fingers_are_joint = self._get_landmark_dist(index_tip, middle_tip) < PINCH_THRESHOLD
 
         if not fingers_are_joint:
             return "none"
@@ -342,6 +365,8 @@ class HeadTracker:
             command = ["ydotool", "mousemove", "-w", "-x 0", f"-y {SCROLL_AMOUNT}"]
         elif action == "scroll_down":
             command = ["ydotool", "mousemove", "-w", "-x 0", f"-y -{SCROLL_AMOUNT}"]
+        elif action == "left_click":
+            command = ["ydotool", "click", "left"]
 
         if command:
             try:
