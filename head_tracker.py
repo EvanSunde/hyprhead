@@ -22,12 +22,12 @@ SCREEN_WIDTH = 1920  # Adjust to your screen resolution
 SCREEN_HEIGHT = 1080  # Adjust to your screen resolution
 SMOOTHING_FACTOR = 0.8  # Adjust for smoother transitions (higher = smoother but more lag)
 FOCUS_COOLDOWN = 1.5  # Seconds between focus changes
-CLICK_COOLDOWN = 0.5  # Seconds between clicks
 SCROLL_COOLDOWN = 0.3  # Seconds between scrolls
 VIDEO_WIDTH = 320  # Lower resolution for better performance
 VIDEO_HEIGHT = 240  # Lower resolution for better performance
 FRAME_RATE = 10  # Process fewer frames per second to reduce CPU usage
 PROCESS_EVERY_N_FRAMES = 3  # Only process every Nth frame to reduce CPU usage
+GESTURE_STABILIZATION_FRAMES = 3  # Number of frames to stabilize a gesture
 
 # Head position thresholds
 LEFT_THRESHOLD = -0.6  # Values below this are considered "looking left"
@@ -60,8 +60,8 @@ class HeadTracker:
         )
 
         # Gesture control state
-        self.last_click_time = 0
         self.last_scroll_time = 0
+        self.gesture_buffer = []
         
         self.cap = None
         self.running = False
@@ -266,14 +266,28 @@ class HeadTracker:
         """Detect and process hand gestures for mouse control."""
         current_time = time.time()
 
-        # Cooldown checks
+        # Detect gesture from the current frame
+        scroll_gesture, speed_factor = self._detect_scroll_gesture(hand_landmarks)
+        
+        # Add to gesture buffer for stabilization
+        self.gesture_buffer.append(scroll_gesture)
+        if len(self.gesture_buffer) > GESTURE_STABILIZATION_FRAMES:
+            self.gesture_buffer.pop(0)
+            
+        # Determine stable gesture
+        stable_gesture = "none"
+        if len(self.gesture_buffer) == GESTURE_STABILIZATION_FRAMES and all(g == self.gesture_buffer[0] for g in self.gesture_buffer):
+            stable_gesture = self.gesture_buffer[0]
+
+        # Cooldown check
         can_scroll = (current_time - self.last_scroll_time) > SCROLL_COOLDOWN
 
-        # Scroll detection
-        if can_scroll:
-            scroll_gesture, speed_factor = self._detect_scroll_gesture(hand_landmarks)
-            if scroll_gesture != "none":
-                self._execute_mouse_action(scroll_gesture, speed_factor)
+        # Execute action if gesture is stable and not "none"
+        if can_scroll and stable_gesture != "none":
+            # We use the speed factor from the current frame for responsiveness
+            _, current_speed_factor = self._detect_scroll_gesture(hand_landmarks)
+            if current_speed_factor > 0: # Only scroll if there's speed
+                self._execute_mouse_action(stable_gesture, current_speed_factor)
                 self.last_scroll_time = current_time
 
     def _get_landmark_dist(self, p1, p2) -> float:
@@ -334,17 +348,17 @@ class HeadTracker:
 
         if action == "scroll_up":
             scroll_amount = max(1, int(15 * speed_factor))
-            command = ["ydotool", "mousemove", "--wheel", "0", f"{scroll_amount}"]
+            command = ["ydotool", "mousemove", "-w", "-x 0", f"-y {scroll_amount}"]
         elif action == "scroll_down":
             scroll_amount = max(1, int(15 * speed_factor))
-            command = ["ydotool", "mousemove", "--wheel", "0", f"-{scroll_amount}"]
+            command = ["ydotool", "mousemove", "-w", "-x 0", f"-y -{scroll_amount}"]
 
         if command:
             try:
                 subprocess.run(command, check=True, capture_output=True, text=True)
                 print(f"Executed action: {action} with amount {scroll_amount}")
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                print(f"Error executing ydotool for {action}: {e.stderr}")
+                print(f"Error executing ydotool for {action}: {e.stderr if hasattr(e, 'stderr') else e}")
     
     def _estimate_head_rotation(self, face_landmarks) -> float:
         """Estimate head rotation from face landmarks (left-right)"""
