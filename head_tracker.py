@@ -15,20 +15,23 @@ from typing import Tuple, List
 mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
+mp_hands = mp.solutions.hands
 
 # Constants
 SCREEN_WIDTH = 1920  # Adjust to your screen resolution
 SCREEN_HEIGHT = 1080  # Adjust to your screen resolution
 SMOOTHING_FACTOR = 0.8  # Adjust for smoother transitions (higher = smoother but more lag)
 FOCUS_COOLDOWN = 1.5  # Seconds between focus changes
+CLICK_COOLDOWN = 0.5  # Seconds between clicks
+SCROLL_COOLDOWN = 0.3  # Seconds between scrolls
 VIDEO_WIDTH = 320  # Lower resolution for better performance
 VIDEO_HEIGHT = 240  # Lower resolution for better performance
 FRAME_RATE = 10  # Process fewer frames per second to reduce CPU usage
 PROCESS_EVERY_N_FRAMES = 3  # Only process every Nth frame to reduce CPU usage
 
 # Head position thresholds
-LEFT_THRESHOLD = -0.3  # Values below this are considered "looking left"
-RIGHT_THRESHOLD = 0.3  # Values above this are considered "looking right"
+LEFT_THRESHOLD = -0.6  # Values below this are considered "looking left"
+RIGHT_THRESHOLD = 0.5  # Values above this are considered "looking right"
 # Values between LEFT_THRESHOLD and RIGHT_THRESHOLD are considered "center"
 
 # Camera indices to try (USB cameras typically start at 0 or 1)
@@ -48,6 +51,17 @@ class HeadTracker:
             min_tracking_confidence=0.5,
             static_image_mode=False  # Faster processing for video
         )
+        
+        # Hand tracking setup
+        self.hands = mp_hands.Hands(
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
+        )
+
+        # Gesture control state
+        self.last_click_time = 0
+        self.last_scroll_time = 0
         
         self.cap = None
         self.running = False
@@ -72,13 +86,6 @@ class HeadTracker:
         
         # For tracking head position zone
         self.current_head_zone = "center"
-        
-        # For background processing
-        self.processing_thread = None
-        self.last_frame = None
-        self.frame_ready = False
-        self.result_ready = False
-        self.processed_results = None
         
     def _get_monitors(self):
         """Get list of monitors from Hyprland"""
@@ -144,34 +151,6 @@ class HeadTracker:
         cv2.destroyAllWindows()
         print("Head tracking stopped.")
     
-    def _process_frame_background(self, frame):
-        """Process a frame in a background thread"""
-        if frame is None:
-            return
-            
-        # Convert to RGB and process with MediaPipe
-        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(image_rgb)
-        
-        if results.multi_face_landmarks:
-            face_landmarks = results.multi_face_landmarks[0]
-            
-            # Get head rotation
-            head_rotation = self._estimate_head_rotation(face_landmarks)
-            
-            # Apply smoothing
-            smoothed_rotation = self._smooth_head_rotation(head_rotation)
-            
-            # Determine head position zone (left, center, right)
-            self._update_head_zone(smoothed_rotation)
-            
-            # Store results for main thread
-            self.processed_results = {
-                "face_landmarks": face_landmarks,
-                "smoothed_rotation": smoothed_rotation
-            }
-            self.result_ready = True
-    
     def _tracking_loop(self):
         """Main tracking loop"""
         while self.running and self.cap.isOpened():
@@ -206,10 +185,11 @@ class HeadTracker:
             
             # Process frame
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.face_mesh.process(image_rgb)
+            face_results = self.face_mesh.process(image_rgb)
+            hand_results = self.hands.process(image_rgb)
             
-            if results.multi_face_landmarks:
-                face_landmarks = results.multi_face_landmarks[0]
+            if face_results.multi_face_landmarks:
+                face_landmarks = face_results.multi_face_landmarks[0]
                 
                 if self.debug_mode:
                     # Draw face mesh
@@ -231,6 +211,12 @@ class HeadTracker:
                     # Add debug info to image
                     self._update_debug_display(frame, smoothed_rotation)
             
+            if hand_results.multi_hand_landmarks:
+                for hand_landmarks in hand_results.multi_hand_landmarks:
+                    if self.debug_mode:
+                        self._draw_hand_landmarks(frame, hand_landmarks)
+                    self._process_hand_gestures(hand_landmarks)
+
             # Display the image if in debug mode
             if self.debug_mode:
                 cv2.imshow('MediaPipe Head Tracking', frame)
@@ -265,6 +251,100 @@ class HeadTracker:
             landmark_drawing_spec=None,
             connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_iris_connections_style()
         )
+
+    def _draw_hand_landmarks(self, image, hand_landmarks):
+        """Draw hand landmarks on the image"""
+        mp_drawing.draw_landmarks(
+            image=image,
+            landmark_list=hand_landmarks,
+            connections=mp_hands.HAND_CONNECTIONS,
+            landmark_drawing_spec=mp_drawing_styles.get_default_hand_landmarks_style(),
+            connection_drawing_spec=mp_drawing_styles.get_default_hand_connections_style()
+        )
+
+    def _process_hand_gestures(self, hand_landmarks):
+        """Detect and process hand gestures for mouse control."""
+        current_time = time.time()
+
+        # Cooldown checks
+        can_scroll = (current_time - self.last_scroll_time) > SCROLL_COOLDOWN
+
+        # Scroll detection
+        if can_scroll:
+            scroll_gesture, speed_factor = self._detect_scroll_gesture(hand_landmarks)
+            if scroll_gesture != "none":
+                self._execute_mouse_action(scroll_gesture, speed_factor)
+                self.last_scroll_time = current_time
+
+    def _get_landmark_dist(self, p1, p2) -> float:
+        """Calculate Euclidean distance between two landmarks."""
+        return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
+
+    def _detect_scroll_gesture(self, hand_landmarks) -> Tuple[str, float]:
+        """
+        Detects scroll gesture: Index and middle fingers pointing up or down,
+        while other fingers are folded. Returns gesture type and speed factor.
+        """
+        # Get landmark y-coordinates
+        def is_finger_extended(tip_landmark, pip_landmark):
+            return tip_landmark.y < pip_landmark.y
+
+        def is_finger_folded(tip_landmark, pip_landmark):
+            return tip_landmark.y > pip_landmark.y
+
+        landmarks = hand_landmarks.landmark
+
+        index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+        middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+        wrist = landmarks[mp_hands.HandLandmark.WRIST]
+
+        # Check if index and middle fingers are close together
+        fingers_are_joint = self._get_landmark_dist(index_tip, middle_tip) < 0.02 # Threshold for pinch detection
+
+        if not fingers_are_joint:
+            return "none", 0.0
+
+        # Check extension/flexion of each finger
+        index_extended = is_finger_extended(index_tip, landmarks[mp_hands.HandLandmark.INDEX_FINGER_PIP])
+        middle_extended = is_finger_extended(middle_tip, landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_PIP])
+        ring_folded = is_finger_folded(landmarks[mp_hands.HandLandmark.RING_FINGER_TIP], landmarks[mp_hands.HandLandmark.RING_FINGER_PIP])
+        pinky_folded = is_finger_folded(landmarks[mp_hands.HandLandmark.PINKY_TIP], landmarks[mp_hands.HandLandmark.PINKY_PIP])
+
+        index_down = is_finger_folded(index_tip, landmarks[mp_hands.HandLandmark.INDEX_FINGER_PIP])
+        middle_down = is_finger_folded(middle_tip, landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_PIP])
+
+        # Scroll up gesture
+        if index_extended and middle_extended and ring_folded and pinky_folded:
+            # Calculate speed factor based on how high fingers are pointed
+            speed_factor = (wrist.y - index_tip.y) * 2.5 # Scale factor
+            return "scroll_up", max(0.1, speed_factor)
+        
+        # Scroll down gesture
+        if index_down and middle_down and ring_folded and pinky_folded:
+            # Calculate speed factor based on how low fingers are pointed
+            speed_factor = (index_tip.y - wrist.y) * 2.5 # Scale factor
+            return "scroll_down", max(0.1, speed_factor)
+            
+        return "none", 0.0
+
+    def _execute_mouse_action(self, action: str, speed_factor: float = 1.0):
+        """Executes a mouse action using ydotool."""
+        command = []
+        scroll_amount = 0
+
+        if action == "scroll_up":
+            scroll_amount = max(1, int(15 * speed_factor))
+            command = ["ydotool", "mousemove", "--wheel", "0", f"{scroll_amount}"]
+        elif action == "scroll_down":
+            scroll_amount = max(1, int(15 * speed_factor))
+            command = ["ydotool", "mousemove", "--wheel", "0", f"-{scroll_amount}"]
+
+        if command:
+            try:
+                subprocess.run(command, check=True, capture_output=True, text=True)
+                print(f"Executed action: {action} with amount {scroll_amount}")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                print(f"Error executing ydotool for {action}: {e.stderr}")
     
     def _estimate_head_rotation(self, face_landmarks) -> float:
         """Estimate head rotation from face landmarks (left-right)"""
