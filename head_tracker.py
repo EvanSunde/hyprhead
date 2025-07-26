@@ -34,9 +34,8 @@ CLICK_COOLDOWN = 0.5  # Seconds between clicks
 SCROLL_COOLDOWN = 0.1  # Seconds between scroll actions
 SCROLL_REGION_THRESHOLD = 0.5  # Threshold to divide upper and lower scroll regions
 SCROLL_AMOUNT_UPPER = 2  # Scroll amount for upper region
-SCROLL_AMOUNT_LOWER = 5  # Scroll amount for lower region
+SCROLL_AMOUNT_LOWER = 2  # Scroll amount for lower region
 PINCH_DRAG_THRESHOLD = 0.03  # Movement threshold to detect drag after pinch
-DOUBLE_PINCH_TIME = 0.5  # Maximum time between pinches for double-pinch detection
 PINCH_HISTORY_SIZE = 5  # Number of frames to keep for pinch state smoothing
 
 # Head position thresholds
@@ -78,12 +77,6 @@ class HeadTracker:
         
         # Pinch state smoothing
         self.pinch_history = deque(maxlen=PINCH_HISTORY_SIZE)
-        
-        # Double pinch detection
-        self.last_pinch_time = 0
-        self.pinch_count = 0
-        self.last_pinch_release_time = 0
-        self.waiting_for_second_pinch = False
         
         # Display stabilization
         self.debug_frame = None
@@ -296,12 +289,6 @@ class HeadTracker:
         self.continuous_scroll_active = False
         self.pinch_history.clear()
         
-        # If we were waiting for a second pinch and it didn't happen, reset
-        current_time = time.time()
-        if self.waiting_for_second_pinch and (current_time - self.last_pinch_release_time) > DOUBLE_PINCH_TIME:
-            self.waiting_for_second_pinch = False
-            self.pinch_count = 0
-    
     def _update_debug_display(self, frame, smoothed_rotation=None):
         """Update the debug information displayed on the frame"""
         # Add FPS counter
@@ -327,14 +314,6 @@ class HeadTracker:
             if self.continuous_scroll_active:
                 cv2.putText(frame, f"Scrolling: {'Down' if self.continuous_scroll_direction > 0 else 'Up'} ({self.continuous_scroll_speed})", 
                             (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-            # Add double pinch info
-            if self.waiting_for_second_pinch:
-                cv2.putText(frame, "Waiting for second pinch...", (10, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-            cv2.putText(frame, f"Pinch count: {self.pinch_count}", (10, 270),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
     def _draw_face_mesh(self, image, face_landmarks):
         """Draw the face mesh on the image"""
@@ -399,29 +378,27 @@ class HeadTracker:
                         # New pinch detected
                         self.pinch_active = True
                         self.pinch_start_y = index_tip.y
-                        self.last_pinch_time = current_time
                         
-                        # Handle double pinch detection
-                        if self.waiting_for_second_pinch and (current_time - self.last_pinch_release_time) < DOUBLE_PINCH_TIME:
-                            # Second pinch detected within time window - execute left click
-                            self._execute_mouse_action("left_click")
-                            self.last_click_time = current_time
-                            self.waiting_for_second_pinch = False
-                            self.pinch_count = 0
-                            print("Double pinch detected - left click executed")
-                        else:
-                            # Check for three-finger pinch (right click)
-                            if self._detect_three_finger_pinch(hand_landmarks):
-                                if current_time - self.last_click_time > CLICK_COOLDOWN:
-                                    self._execute_mouse_action("right_click")
-                                    self.last_click_time = current_time
+                        # Check for two-finger pinch (left click)
+                        if self._detect_two_finger_pinch(hand_landmarks):
+                            if current_time - self.last_click_time > CLICK_COOLDOWN:
+                                self._execute_mouse_action("left_click")
+                                self.last_click_time = current_time
+                                print("Two-finger pinch detected - left click executed")
+                        
+                        # Check for three-finger pinch (right click)
+                        elif self._detect_three_finger_pinch(hand_landmarks):
+                            if current_time - self.last_click_time > CLICK_COOLDOWN:
+                                self._execute_mouse_action("right_click")
+                                self.last_click_time = current_time
+                                print("Three-finger pinch detected - right click executed")
                     else:
                         # Continuing pinch, check for drag
                         y_movement = index_tip.y - self.pinch_start_y
                         
                         if abs(y_movement) > PINCH_DRAG_THRESHOLD:
                             # Determine scroll direction (positive y is down in image coordinates)
-                            direction = 1 if y_movement > 0 else -1
+                            direction = -1 if y_movement > 0 else 1
                             
                             # Determine scroll region and speed
                             if index_tip.y > SCROLL_REGION_THRESHOLD:
@@ -440,23 +417,11 @@ class HeadTracker:
                             if current_time - self.last_scroll_time > SCROLL_COOLDOWN:
                                 self._execute_scroll(direction, scroll_amount)
                                 self.last_scroll_time = current_time
-                            
-                            # Cancel double pinch detection if we're scrolling
-                            self.waiting_for_second_pinch = False
-                            self.pinch_count = 0
                 else:
                     # Pinch released
                     if self.pinch_active:
                         self.pinch_active = False
                         self.continuous_scroll_active = False
-                        self.last_pinch_release_time = current_time
-                        
-                        # If the pinch was brief (no scrolling activated), count it for double pinch
-                        if not self.continuous_scroll_active:
-                            self.pinch_count += 1
-                            if self.pinch_count == 1:
-                                self.waiting_for_second_pinch = True
-                                print("First pinch detected, waiting for second")
                 
                 # Store last hand landmarks
                 self.last_hand_landmarks = hand_landmarks
@@ -479,6 +444,27 @@ class HeadTracker:
             return distance < PINCH_THRESHOLD
         except Exception as e:
             print(f"Error detecting pinch gesture: {e}")
+            return False
+    
+    def _detect_two_finger_pinch(self, hand_landmarks) -> bool:
+        """Detect two-finger pinch (thumb and index finger)"""
+        try:
+            landmarks = hand_landmarks.landmark
+            
+            # Get thumb and index finger tip positions
+            thumb_tip = landmarks[mp_hands.HandLandmark.THUMB_TIP]
+            index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+            
+            # Calculate distances
+            thumb_index_dist = self._get_landmark_dist(thumb_tip, index_tip)
+            index_middle_dist = self._get_landmark_dist(index_tip, middle_tip)
+            
+            # Thumb and index finger must be close, but index and middle finger must be separated
+            return (thumb_index_dist < PINCH_THRESHOLD and 
+                    index_middle_dist > PINCH_THRESHOLD * 2)
+        except Exception as e:
+            print(f"Error detecting two-finger pinch: {e}")
             return False
     
     def _detect_three_finger_pinch(self, hand_landmarks) -> bool:
