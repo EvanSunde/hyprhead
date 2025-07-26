@@ -28,9 +28,10 @@ VIDEO_HEIGHT = 240  # Lower resolution for better performance
 FRAME_RATE = 10  # Process fewer frames per second to reduce CPU usage
 PROCESS_EVERY_N_FRAMES = 3  # Only process every Nth frame to reduce CPU usage
 GESTURE_STABILIZATION_FRAMES = 3  # Number of frames to stabilize a gesture
-SCROLL_AMOUNT = 1  # Constant scroll amount (adjust as needed)
+SCROLL_AMOUNT = 2  # Constant scroll amount (adjust as needed)
 PINCH_THRESHOLD = 0.02  # Threshold for pinch detection
 CLICK_COOLDOWN = 0.5  # Seconds between clicks
+ENABLE_CLICK = True  # Set to False to disable click functionality
 
 # Head position thresholds
 LEFT_THRESHOLD = -0.6  # Values below this are considered "looking left"
@@ -38,10 +39,10 @@ RIGHT_THRESHOLD = 0.5  # Values above this are considered "looking right"
 # Values between LEFT_THRESHOLD and RIGHT_THRESHOLD are considered "center"
 
 # Camera indices to try (USB cameras typically start at 0 or 1)
-CAMERA_INDICES = [1, 0, 2]  # Try USB camera (1) first, then built-in (0), then another USB port (2)
+CAMERA_INDICES = [2, 1, 0, 2]  # Try USB camera (1) first, then built-in (0), then another USB port (2)
 
 class HeadTracker:
-    def __init__(self, center_position="center", debug_mode=True):
+    def __init__(self, center_position="center", debug_mode=True, enable_click=True):
         self.last_focus_time = 0
         self.prev_head_rotation = 0
         self.monitors = self._get_monitors()
@@ -66,6 +67,7 @@ class HeadTracker:
         self.last_scroll_time = 0
         self.last_click_time = 0
         self.gesture_buffer = []
+        self.enable_click = enable_click
         
         self.cap = None
         self.running = False
@@ -270,8 +272,8 @@ class HeadTracker:
         """Detect and process hand gestures for mouse control."""
         current_time = time.time()
 
-        # First check for pinch gesture (higher priority)
-        if self._detect_pinch_gesture(hand_landmarks) and (current_time - self.last_click_time) > CLICK_COOLDOWN:
+        # First check for pinch gesture (higher priority) if click is enabled
+        if self.enable_click and self._detect_pinch_gesture(hand_landmarks) and (current_time - self.last_click_time) > CLICK_COOLDOWN:
             self._execute_mouse_action("left_click")
             self.last_click_time = current_time
             return  # Skip scroll detection if we just clicked
@@ -471,11 +473,13 @@ def parse_args():
                         help="Define where the center position is (default: center)")
     parser.add_argument("--no-debug", action="store_true",
                         help="Disable debug display to save CPU")
+    parser.add_argument("--no-click", action="store_true",
+                        help="Disable left click functionality")
     return parser.parse_args()
 
 def main():
     args = parse_args()
-    tracker = HeadTracker(center_position=args.center, debug_mode=not args.no_debug)
+    tracker = HeadTracker(center_position=args.center, debug_mode=not args.no_debug, enable_click=not args.no_click)
     try:
         tracker.start()
     except KeyboardInterrupt:
