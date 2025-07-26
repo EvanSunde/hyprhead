@@ -32,9 +32,7 @@ PROCESS_EVERY_N_FRAMES = 3  # Only process every Nth frame to reduce CPU usage
 PINCH_THRESHOLD = 0.03  # Increased threshold for more reliable pinch detection
 CLICK_COOLDOWN = 0.5  # Seconds between clicks
 SCROLL_COOLDOWN = 0.1  # Seconds between scroll actions
-SCROLL_REGION_THRESHOLD = 0.5  # Threshold to divide upper and lower scroll regions
-SCROLL_AMOUNT_UPPER = 2  # Scroll amount for upper region
-SCROLL_AMOUNT_LOWER = 2  # Scroll amount for lower region
+SCROLL_AMOUNT = 2  # Constant scroll amount
 PINCH_DRAG_THRESHOLD = 0.03  # Movement threshold to detect drag after pinch
 PINCH_HISTORY_SIZE = 5  # Number of frames to keep for pinch state smoothing
 
@@ -400,22 +398,14 @@ class HeadTracker:
                             # Determine scroll direction (positive y is down in image coordinates)
                             direction = -1 if y_movement > 0 else 1
                             
-                            # Determine scroll region and speed
-                            if index_tip.y > SCROLL_REGION_THRESHOLD:
-                                # Lower region - faster scrolling
-                                scroll_amount = SCROLL_AMOUNT_LOWER
-                            else:
-                                # Upper region - slower scrolling
-                                scroll_amount = SCROLL_AMOUNT_UPPER
-                            
-                            # Activate continuous scrolling
+                            # Activate continuous scrolling with constant scroll amount
                             self.continuous_scroll_active = True
                             self.continuous_scroll_direction = direction
-                            self.continuous_scroll_speed = scroll_amount
+                            self.continuous_scroll_speed = SCROLL_AMOUNT
                             
                             # Execute immediate scroll
                             if current_time - self.last_scroll_time > SCROLL_COOLDOWN:
-                                self._execute_scroll(direction, scroll_amount)
+                                self._execute_scroll(direction, SCROLL_AMOUNT)
                                 self.last_scroll_time = current_time
                 else:
                     # Pinch released
