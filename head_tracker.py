@@ -42,7 +42,7 @@ RIGHT_THRESHOLD = 0.5  # Values above this are considered "looking right"
 # Values between LEFT_THRESHOLD and RIGHT_THRESHOLD are considered "center"
 
 # Camera indices to try (USB cameras typically start at 0 or 1)
-CAMERA_INDICES = [1, 2, 3]  # Try built-in (0) first, then USB cameras
+CAMERA_INDICES = [0, 1, 2, 3]  # Try built-in (0) first, then USB cameras
 
 class HeadTracker:
     def __init__(self, center_position="center", debug_mode=True, enable_hand_gestures=True):
@@ -377,19 +377,19 @@ class HeadTracker:
                         self.pinch_active = True
                         self.pinch_start_y = index_tip.y
                         
-                        # Check for two-finger pinch (left click)
-                        if self._detect_two_finger_pinch(hand_landmarks):
+                        # Check for three-finger pinch (left click)
+                        if self._detect_three_finger_pinch(hand_landmarks):
                             if current_time - self.last_click_time > CLICK_COOLDOWN:
                                 self._execute_mouse_action("left_click")
                                 self.last_click_time = current_time
-                                print("Two-finger pinch detected - left click executed")
+                                print("Three-finger pinch detected - left click executed")
                         
-                        # Check for three-finger pinch (right click)
-                        elif self._detect_three_finger_pinch(hand_landmarks):
+                        # Check for four-finger pinch (right click)
+                        elif self._detect_four_finger_pinch(hand_landmarks):
                             if current_time - self.last_click_time > CLICK_COOLDOWN:
                                 self._execute_mouse_action("right_click")
                                 self.last_click_time = current_time
-                                print("Three-finger pinch detected - right click executed")
+                                print("Four-finger pinch detected - right click executed")
                     else:
                         # Continuing pinch, check for drag
                         y_movement = index_tip.y - self.pinch_start_y
@@ -436,27 +436,6 @@ class HeadTracker:
             print(f"Error detecting pinch gesture: {e}")
             return False
     
-    def _detect_two_finger_pinch(self, hand_landmarks) -> bool:
-        """Detect two-finger pinch (thumb and index finger)"""
-        try:
-            landmarks = hand_landmarks.landmark
-            
-            # Get thumb and index finger tip positions
-            thumb_tip = landmarks[mp_hands.HandLandmark.THUMB_TIP]
-            index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-            middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-            
-            # Calculate distances
-            thumb_index_dist = self._get_landmark_dist(thumb_tip, index_tip)
-            index_middle_dist = self._get_landmark_dist(index_tip, middle_tip)
-            
-            # Thumb and index finger must be close, but index and middle finger must be separated
-            return (thumb_index_dist < PINCH_THRESHOLD and 
-                    index_middle_dist > PINCH_THRESHOLD * 2)
-        except Exception as e:
-            print(f"Error detecting two-finger pinch: {e}")
-            return False
-    
     def _detect_three_finger_pinch(self, hand_landmarks) -> bool:
         """Detect three-finger pinch (thumb, index, and middle fingers)"""
         try:
@@ -480,6 +459,34 @@ class HeadTracker:
             print(f"Error detecting three-finger pinch: {e}")
             return False
     
+    def _detect_four_finger_pinch(self, hand_landmarks) -> bool:
+        """Detect four-finger pinch (thumb, index, middle, and ring fingers)"""
+        try:
+            landmarks = hand_landmarks.landmark
+            
+            # Get thumb, index, middle, and ring finger tip positions
+            thumb_tip = landmarks[mp_hands.HandLandmark.THUMB_TIP]
+            index_tip = landmarks[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            middle_tip = landmarks[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+            ring_tip = landmarks[mp_hands.HandLandmark.RING_FINGER_TIP]
+            
+            # Calculate distances
+            thumb_index_dist = self._get_landmark_dist(thumb_tip, index_tip)
+            thumb_middle_dist = self._get_landmark_dist(thumb_tip, middle_tip)
+            thumb_ring_dist = self._get_landmark_dist(thumb_tip, ring_tip)
+            index_middle_dist = self._get_landmark_dist(index_tip, middle_tip)
+            middle_ring_dist = self._get_landmark_dist(middle_tip, ring_tip)
+            
+            # All four fingers must be close together
+            return (thumb_index_dist < PINCH_THRESHOLD and 
+                    thumb_middle_dist < PINCH_THRESHOLD and 
+                    thumb_ring_dist < PINCH_THRESHOLD and
+                    index_middle_dist < PINCH_THRESHOLD and
+                    middle_ring_dist < PINCH_THRESHOLD)
+        except Exception as e:
+            print(f"Error detecting four-finger pinch: {e}")
+            return False
+    
     def _get_landmark_dist(self, p1, p2) -> float:
         """Calculate Euclidean distance between two landmarks"""
         return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
@@ -491,7 +498,7 @@ class HeadTracker:
         if action == "left_click":
             command = ["ydotool", "click", "c0"]
         elif action == "right_click":
-            command = ["ydotool", "click", "c2"]
+            command = ["ydotool", "click", "c1"]
         
         if command:
             try:
