@@ -39,10 +39,10 @@ RIGHT_THRESHOLD = 0.5  # Values above this are considered "looking right"
 # Values between LEFT_THRESHOLD and RIGHT_THRESHOLD are considered "center"
 
 # Camera indices to try (USB cameras typically start at 0 or 1)
-CAMERA_INDICES = [2, 1, 0, 2]  # Try USB camera (1) first, then built-in (0), then another USB port (2)
+CAMERA_INDICES = [0, 1, 2, 3]  # Try USB camera (1) first, then built-in (0), then another USB port (2)
 
 class HeadTracker:
-    def __init__(self, center_position="center", debug_mode=True, enable_click=True):
+    def __init__(self, center_position="center", debug_mode=True, enable_click=True, enable_hands=True):
         self.last_focus_time = 0
         self.prev_head_rotation = 0
         self.monitors = self._get_monitors()
@@ -57,17 +57,20 @@ class HeadTracker:
         )
         
         # Hand tracking setup
-        self.hands = mp_hands.Hands(
-            max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7
-        )
+        self.enable_hands = enable_hands
+        self.hands = None
+        if self.enable_hands:
+            self.hands = mp_hands.Hands(
+                max_num_hands=1,
+                min_detection_confidence=0.7,
+                min_tracking_confidence=0.7
+            )
 
         # Gesture control state
         self.last_scroll_time = 0
         self.last_click_time = 0
         self.gesture_buffer = []
-        self.enable_click = enable_click
+        self.enable_click = enable_click and enable_hands  # Click requires hands to be enabled
         
         self.cap = None
         self.running = False
@@ -192,7 +195,11 @@ class HeadTracker:
             # Process frame
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             face_results = self.face_mesh.process(image_rgb)
-            hand_results = self.hands.process(image_rgb)
+            
+            # Process hand tracking only if enabled
+            hand_results = None
+            if self.enable_hands:
+                hand_results = self.hands.process(image_rgb)
             
             if face_results.multi_face_landmarks:
                 face_landmarks = face_results.multi_face_landmarks[0]
@@ -217,7 +224,8 @@ class HeadTracker:
                     # Add debug info to image
                     self._update_debug_display(frame, smoothed_rotation)
             
-            if hand_results.multi_hand_landmarks:
+            # Process hand gestures if enabled
+            if self.enable_hands and hand_results and hand_results.multi_hand_landmarks:
                 for hand_landmarks in hand_results.multi_hand_landmarks:
                     if self.debug_mode:
                         self._draw_hand_landmarks(frame, hand_landmarks)
@@ -475,11 +483,18 @@ def parse_args():
                         help="Disable debug display to save CPU")
     parser.add_argument("--no-click", action="store_true",
                         help="Disable left click functionality")
+    parser.add_argument("--head-only", action="store_true",
+                        help="Disable all hand tracking, use head tracking only")
     return parser.parse_args()
 
 def main():
     args = parse_args()
-    tracker = HeadTracker(center_position=args.center, debug_mode=not args.no_debug, enable_click=not args.no_click)
+    tracker = HeadTracker(
+        center_position=args.center, 
+        debug_mode=not args.no_debug,
+        enable_click=not args.no_click,
+        enable_hands=not args.head_only
+    )
     try:
         tracker.start()
     except KeyboardInterrupt:
