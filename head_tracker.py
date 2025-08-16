@@ -21,7 +21,7 @@ mp_hands = mp.solutions.hands
 SCREEN_WIDTH = 1920  # Adjust to your screen resolution
 SCREEN_HEIGHT = 1080  # Adjust to your screen resolution
 SMOOTHING_FACTOR = 0.8  # Adjust for smoother transitions (higher = smoother but more lag)
-FOCUS_COOLDOWN = 1.5  # Seconds between focus changes
+FOCUS_COOLDOWN = 0.5  # Seconds between focus changes
 SCROLL_COOLDOWN = 0.3  # Seconds between scrolls
 VIDEO_WIDTH = 320  # Lower resolution for better performance
 VIDEO_HEIGHT = 240  # Lower resolution for better performance
@@ -30,7 +30,7 @@ PROCESS_EVERY_N_FRAMES = 3  # Only process every Nth frame to reduce CPU usage
 GESTURE_STABILIZATION_FRAMES = 3  # Number of frames to stabilize a gesture
 SCROLL_AMOUNT = 2  # Constant scroll amount (adjust as needed)
 PINCH_THRESHOLD = 0.02  # Threshold for pinch detection
-CLICK_COOLDOWN = 0.5  # Seconds between clicks
+CLICK_COOLDOWN = 1.5  # Seconds between clicks
 ENABLE_CLICK = True  # Set to False to disable click functionality
 
 # Head position thresholds
@@ -38,11 +38,19 @@ LEFT_THRESHOLD = -0.6  # Values below this are considered "looking left"
 RIGHT_THRESHOLD = 0.5  # Values above this are considered "looking right"
 # Values between LEFT_THRESHOLD and RIGHT_THRESHOLD are considered "center"
 
+# Cursor control tuning (nose-controlled cursor)
+CURSOR_SMOOTHING_FACTOR = 0.6  # Higher = smoother but more lag
+CURSOR_DEADZONE_PX = 3  # Minimum pixel movement to trigger an update
+NOSE_CURSOR_MAX_HZ = 20  # Max frequency to send cursor updates (limits subprocess calls)
+
+# Hand processing frequency (process hands every N processed frames)
+HANDS_PROCESS_EVERY_N_FRAMES = 6
+
 # Camera indices to try (USB cameras typically start at 0 or 1)
-CAMERA_INDICES = [0, 1, 2, 3]  # Try USB camera (1) first, then built-in (0), then another USB port (2)
+CAMERA_INDICES = [2,3 ,0, 1]  # Try USB camera (1) first, then built-in (0), then another USB port (2)
 
 class HeadTracker:
-    def __init__(self, center_position="center", debug_mode=True, enable_click=True, enable_hands=True):
+    def __init__(self, center_position="center", debug_mode=True, enable_click=True, enable_hands=True, enable_nose_cursor=False):
         self.last_focus_time = 0
         self.prev_head_rotation = 0
         self.monitors = self._get_monitors()
@@ -50,7 +58,7 @@ class HeadTracker:
         # Performance optimization: Use static image mode for less CPU usage
         self.face_mesh = mp_face_mesh.FaceMesh(
             max_num_faces=1,
-            refine_landmarks=True,
+            refine_landmarks=False,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
             static_image_mode=False  # Faster processing for video
@@ -62,15 +70,29 @@ class HeadTracker:
         if self.enable_hands:
             self.hands = mp_hands.Hands(
                 max_num_hands=1,
-                min_detection_confidence=0.7,
-                min_tracking_confidence=0.7
+                model_complexity=0,
+                min_detection_confidence=0.6,
+                min_tracking_confidence=0.6
             )
+
+        # Nose-controlled cursor state
+        self.enable_nose_cursor = enable_nose_cursor
+        self.prev_cursor_x = None
+        self.prev_cursor_y = None
+        self.last_nose_move_time = 0.0
 
         # Gesture control state
         self.last_scroll_time = 0
         self.last_click_time = 0
         self.gesture_buffer = []
         self.enable_click = enable_click and enable_hands  # Click requires hands to be enabled
+        
+        # OpenCV optimizations
+        try:
+            cv2.setUseOptimized(True)
+            cv2.setNumThreads(1)
+        except Exception:
+            pass
         
         self.cap = None
         self.running = False
@@ -82,6 +104,7 @@ class HeadTracker:
         # Center position configuration
         self.center_position = center_position
         print(f"Center position set to: {self.center_position}")
+        print(f"Nose cursor enabled: {self.enable_nose_cursor}")
         
         # Set current monitor based on center position
         if self.center_position == "right" and len(self.monitors) > 1:
@@ -143,6 +166,17 @@ class HeadTracker:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VIDEO_HEIGHT)
         self.cap.set(cv2.CAP_PROP_FPS, FRAME_RATE)
+        # Reduce camera buffer to minimize latency and CPU
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        # Prefer MJPG to reduce USB bandwidth/CPU if supported
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            self.cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+        except Exception:
+            pass
         
         self.running = True
         print("Head tracking started. Press 'q' to quit.")
@@ -199,7 +233,9 @@ class HeadTracker:
             # Process hand tracking only if enabled
             hand_results = None
             if self.enable_hands:
-                hand_results = self.hands.process(image_rgb)
+                # Throttle hand processing frequency to save CPU
+                if self.frame_count % HANDS_PROCESS_EVERY_N_FRAMES == 0:
+                    hand_results = self.hands.process(image_rgb)
             
             if face_results.multi_face_landmarks:
                 face_landmarks = face_results.multi_face_landmarks[0]
@@ -219,6 +255,10 @@ class HeadTracker:
                 
                 # Focus monitor based on head zone
                 self._focus_monitor_based_on_head_zone()
+                
+                # Update cursor using nose tip if enabled
+                if self.enable_nose_cursor:
+                    self._update_cursor_from_nose(face_landmarks)
                 
                 if self.debug_mode:
                     # Add debug info to image
@@ -384,6 +424,42 @@ class HeadTracker:
                 print(f"Executed action: {action}")
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
                 print(f"Error executing ydotool for {action}: {e.stderr if hasattr(e, 'stderr') else e}")
+
+    def _update_cursor_from_nose(self, face_landmarks):
+        """Move mouse cursor to nose tip position using ydotool absolute movement."""
+        nose_tip = face_landmarks.landmark[4]
+        # Map normalized [0,1] coords to screen pixels
+        target_x = max(0, min(SCREEN_WIDTH - 1, int(nose_tip.x * SCREEN_WIDTH)))
+        target_y = max(0, min(SCREEN_HEIGHT - 1, int(nose_tip.y * SCREEN_HEIGHT)))
+        
+        # Initialize smoothing state if needed
+        if self.prev_cursor_x is None or self.prev_cursor_y is None:
+            self.prev_cursor_x = target_x
+            self.prev_cursor_y = target_y
+        
+        # Exponential smoothing
+        smoothed_x = int(self.prev_cursor_x * CURSOR_SMOOTHING_FACTOR + target_x * (1 - CURSOR_SMOOTHING_FACTOR))
+        smoothed_y = int(self.prev_cursor_y * CURSOR_SMOOTHING_FACTOR + target_y * (1 - CURSOR_SMOOTHING_FACTOR))
+        
+        # Only move if beyond deadzone to reduce command spam
+        if abs(smoothed_x - self.prev_cursor_x) < CURSOR_DEADZONE_PX and abs(smoothed_y - self.prev_cursor_y) < CURSOR_DEADZONE_PX:
+            return
+        
+        # Throttle updates to limit subprocess overhead
+        now = time.time()
+        min_interval = 1.0 / NOSE_CURSOR_MAX_HZ
+        if (now - self.last_nose_move_time) < min_interval:
+            return
+        self.last_nose_move_time = now
+        
+        self.prev_cursor_x = smoothed_x
+        self.prev_cursor_y = smoothed_y
+        
+        command = ["ydotool", "mousemove", "-a", f"-x {smoothed_x}", f"-y {smoothed_y}"]
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"Error moving cursor with ydotool: {e.stderr if hasattr(e, 'stderr') else e}")
     
     def _estimate_head_rotation(self, face_landmarks) -> float:
         """Estimate head rotation from face landmarks (left-right)"""
@@ -485,6 +561,12 @@ def parse_args():
                         help="Disable left click functionality")
     parser.add_argument("--head-only", action="store_true",
                         help="Disable all hand tracking, use head tracking only")
+    # Nose cursor flags (mutually exclusive)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--nose-cursor", action="store_true",
+                        help="Enable nose-controlled mouse cursor movement (uses ydotool)")
+    group.add_argument("--no-nose-cursor", action="store_true",
+                        help="Disable nose-controlled mouse cursor movement")
     return parser.parse_args()
 
 def main():
@@ -493,7 +575,8 @@ def main():
         center_position=args.center, 
         debug_mode=not args.no_debug,
         enable_click=not args.no_click,
-        enable_hands=not args.head_only
+        enable_hands=not args.head_only,
+        enable_nose_cursor=(args.nose_cursor and not args.no_nose_cursor)
     )
     try:
         tracker.start()
