@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+
+import cv2
+import mediapipe as mp
+import socket
+import os
+import argparse
+import time
+import sys
+import glob
+
+# --- CONFIGURATION ---
+CAMERA_WIDTH = 320
+CAMERA_HEIGHT = 240
+FPS = 15
+PROCESS_EVERY_N_FRAMES = 4
+
+# Sensitivity
+LOOK_LEFT_THRESHOLD = -0.5
+LOOK_RIGHT_THRESHOLD = 0.5
+
+# --- ROBUST HYPRLAND CLIENT ---
+class HyprlandClient:
+    def __init__(self):
+        self.socket_path = None
+        self._find_socket()
+
+    def _find_socket(self):
+        # 1. Try getting signature from environment
+        signature = os.getenv("HYPRLAND_INSTANCE_SIGNATURE")
+        candidates = []
+
+        if signature:
+            # Standard location
+            candidates.append(f"/tmp/hypr/{signature}/.socket.sock")
+            # Fallback location (some distros/configs)
+            xdg = os.getenv("XDG_RUNTIME_DIR")
+            if xdg:
+                candidates.append(f"{xdg}/hypr/{signature}/.socket.sock")
+
+        # 2. If env var is missing or paths don't exist, try globbing /tmp/hypr
+        # This helps if the env var is stale but a valid socket exists
+        candidates.extend(glob.glob("/tmp/hypr/*/.socket.sock"))
+
+        # 3. Check which one actually exists
+        for path in candidates:
+            if os.path.exists(path):
+                self.socket_path = path
+                print(f"✅ IPC Connected: {path}")
+                return
+
+        print(f"❌ Critical Error: Could not find Hyprland socket.")
+        print(f"   Checked locations: {candidates}")
+        print("   Run 'echo $HYPRLAND_INSTANCE_SIGNATURE' to check your env.")
+        # We don't exit here to allow the camera preview to still work for debugging
+
+    def focus_monitor(self, monitor_id):
+        if not self.socket_path:
+            return
+
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(self.socket_path)
+                command = f"dispatch focusmonitor {monitor_id}"
+                s.sendall(command.encode('utf-8'))
+                s.recv(1024) # Ack
+        except Exception as e:
+            print(f"IPC Error ({self.socket_path}): {e}")
+            # If connection failed (maybe socket died), try finding it again
+            self._find_socket()
+
+# --- TRACKER LOGIC ---
+class HeadTracker:
+    def __init__(self, left_id, center_id, right_id, debug):
+        # --- CAMERA SELECTION ---
+        # Added index 2 based on your logs
+        camera_indices = [2, 1, 0]
+        self.cap = None
+
+        print(f"Searching for cameras in order: {camera_indices}...")
+        for idx in camera_indices:
+            temp_cap = cv2.VideoCapture(idx)
+            if temp_cap.isOpened():
+                ret, _ = temp_cap.read()
+                if ret:
+                    print(f"✅ Connected to camera index: {idx}")
+                    self.cap = temp_cap
+                    break
+                else:
+                    temp_cap.release()
+
+        if self.cap is None:
+            print("❌ Error: No working webcam found.")
+            sys.exit(1)
+
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, FPS)
+
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+
+        self.hypr = HyprlandClient()
+        self.left_id = left_id
+        self.center_id = center_id
+        self.right_id = right_id
+        self.debug = debug
+        self.current_zone = "center"
+        self.frame_count = 0
+
+    def get_head_rotation(self, landmarks):
+        left_ear = landmarks.landmark[234]
+        right_ear = landmarks.landmark[454]
+        nose = landmarks.landmark[1]
+
+        face_width = abs(right_ear.x - left_ear.x)
+        if face_width == 0: return 0
+
+        ear_center = (left_ear.x + right_ear.x) / 2
+        return (nose.x - ear_center) / (face_width * 0.5)
+
+    def run(self):
+        print(f"Tracker started. Zones: L={self.left_id}, C={self.center_id}, R={self.right_id}")
+
+        while self.cap.isOpened():
+            success, image = self.cap.read()
+            if not success:
+                print("Failed to read frame.")
+                break
+
+            image = cv2.flip(image, 1)
+
+            self.frame_count += 1
+            if self.frame_count % PROCESS_EVERY_N_FRAMES != 0:
+                if self.debug:
+                    cv2.imshow('Head Tracker', image)
+                    if cv2.waitKey(1) & 0xFF == ord('q'): break
+                continue
+
+            image.flags.writeable = False
+            results = self.face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            image.flags.writeable = True
+
+            target_monitor = None
+            detected_zone = self.current_zone
+
+            if results.multi_face_landmarks:
+                rot = self.get_head_rotation(results.multi_face_landmarks[0])
+
+                if rot < LOOK_LEFT_THRESHOLD:
+                    detected_zone = "left"
+                    target_monitor = self.left_id
+                elif rot > LOOK_RIGHT_THRESHOLD:
+                    detected_zone = "right"
+                    target_monitor = self.right_id
+                else:
+                    detected_zone = "center"
+                    target_monitor = self.center_id
+
+                if detected_zone != self.current_zone:
+                    if target_monitor is not None:
+                        print(f"Switching to {detected_zone} (ID: {target_monitor})")
+                        self.hypr.focus_monitor(target_monitor)
+                    self.current_zone = detected_zone
+
+                if self.debug:
+                    status = f"Zone: {detected_zone}"
+                    cv2.putText(image, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            if self.debug:
+                cv2.imshow('Head Tracker', image)
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--left", type=int, help="Monitor ID for Left Zone")
+    parser.add_argument("--center", type=int, default=0, help="Monitor ID for Center Zone")
+    parser.add_argument("--right", type=int, help="Monitor ID for Right Zone")
+    parser.add_argument("--debug", action="store_true", help="Show camera feed")
+    args = parser.parse_args()
+
+    tracker = HeadTracker(args.left, args.center, args.right, args.debug)
+    tracker.run()
